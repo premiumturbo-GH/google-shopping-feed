@@ -1,0 +1,92 @@
+name: Aktualizuj feed Google Shopping
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wygeneruj XML
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import re
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          shop = "https://premium-turbo.de"
+          ns = "http://base.google.com/ns/1.0"
+          ET.register_namespace("g", ns)
+
+          def fetch(url):
+              with urllib.request.urlopen(url, timeout=20) as response:
+                  return response.read()
+
+          sitemap = ET.fromstring(fetch(shop + "/sitemap.xml"))
+          urls = [node.text for node in sitemap.findall("{*}url/{*}loc")]
+          rss = ET.Element("rss", version="2.0")
+          channel = ET.SubElement(rss, "channel")
+          for key, value in dict(title="Premium Turbo", link=shop,
+                                 description="Turbolader und Ersatzteile").items():
+              ET.SubElement(channel, key).text = value
+
+          for url in urls:
+              html = fetch(url).decode("utf-8-sig")
+              blocks = re.findall(
+                  r'<script\b[^>]*application/ld\+json[^>]*>(.*?)</script>',
+                  html, re.I | re.S,
+              )
+              for block in blocks:
+                  product = json.loads(block)
+                  if isinstance(product, dict) and product.get("@type") == "Product":
+                      break
+              else:
+                  continue
+
+              title = product["name"]
+              if re.match(r"^Professionelle (DPF[\s-]+Reinigung|Turbolader-Pr.fung)", title, re.I):
+                  continue
+              offer = product["offers"]
+              state = {"InStock": "in_stock", "OutOfStock": "out_of_stock"}
+              image = product["image"]
+              fields = {
+                  "id": hashlib.sha256(url.encode()).hexdigest()[:32].upper(),
+                  "title": title[:150],
+                  "description": product["description"],
+                  "link": url,
+                  "image_link": image[0] if isinstance(image, list) else image,
+                  "price": f'{offer["price"]} {offer["priceCurrency"].upper()}',
+                  "availability": state[offer["availability"].rstrip("/").split("/")[-1]],
+                  "condition": "new" if re.search(r"\bNEU\b", title, re.I) else "refurbished",
+              }
+              if not all(fields.values()):
+                  raise ValueError(f"Brak danych produktu: {url}")
+              item = ET.SubElement(channel, "item")
+              for key, value in fields.items():
+                  ET.SubElement(item, f"{{{ns}}}{key}").text = value
+
+          count = len(channel.findall("item"))
+          if not count:
+              raise ValueError("Feed jest pusty")
+          ET.indent(rss)
+          ET.ElementTree(rss).write("premium-turbo-feed.xml", encoding="utf-8", xml_declaration=True)
+          print(f"Produkty w pliku: {count}")
+
+      - name: Zapisz XML
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add premium-turbo-feed.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Aktualizacja feedu Google Shopping"
+            git push
+          fi
